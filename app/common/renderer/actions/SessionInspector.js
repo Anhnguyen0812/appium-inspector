@@ -84,6 +84,8 @@ export const RUN_TEST_FLOW_CURRENT_SESSION_REQUESTED = 'RUN_TEST_FLOW_CURRENT_SE
 export const RUN_TEST_FLOW_CURRENT_SESSION_COMPLETED = 'RUN_TEST_FLOW_CURRENT_SESSION_COMPLETED';
 export const RUN_TEST_FLOW_CURRENT_SESSION_FAILED = 'RUN_TEST_FLOW_CURRENT_SESSION_FAILED';
 export const APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT = 'APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT';
+export const SET_TEST_FLOW_HEALING_SUGGESTION = 'SET_TEST_FLOW_HEALING_SUGGESTION';
+export const CLEAR_TEST_FLOW_HEALING_SUGGESTION = 'CLEAR_TEST_FLOW_HEALING_SUGGESTION';
 export const EXPORT_TEST_FLOW_PYTEST_REQUESTED = 'EXPORT_TEST_FLOW_PYTEST_REQUESTED';
 export const EXPORT_TEST_FLOW_PYTEST_COMPLETED = 'EXPORT_TEST_FLOW_PYTEST_COMPLETED';
 export const EXPORT_TEST_FLOW_PYTEST_FAILED = 'EXPORT_TEST_FLOW_PYTEST_FAILED';
@@ -549,6 +551,53 @@ export function runTestFlowCurrentSession(runConfigOrSteps, stepDelayMs) {
   };
 }
 
+export function applyTestFlowHealingSuggestion(suggestion) {
+  return async (dispatch, getState) => {
+    if (!suggestion?.stepId || !suggestion?.healedLocator?.strategy) {
+      return;
+    }
+
+    const locator = {
+      strategy: suggestion.healedLocator.strategy,
+      value: suggestion.healedLocator.selector,
+    };
+    dispatch({
+      type: UPDATE_TEST_FLOW_STEP,
+      stepId: suggestion.stepId,
+      updates: {
+        locator,
+        healing: {
+          status: suggestion.status,
+          confidence: suggestion.confidence,
+          reason: suggestion.reason,
+          originalLocator: suggestion.originalLocator,
+          appliedAt: Date.now(),
+        },
+      },
+    });
+    dispatch({type: CLEAR_TEST_FLOW_HEALING_SUGGESTION});
+
+    const {recordedTestFlowSteps, testFlowStepDelayMs, currentTestFlowId, savedTestFlows} =
+      getState().inspector;
+    const currentFlow = savedTestFlows?.find((flow) => flow.id === currentTestFlowId);
+    const updatedSteps = recordedTestFlowSteps.map((step) =>
+      step.id === suggestion.stepId
+        ? {
+            ...step,
+            locator,
+          }
+        : step,
+    );
+    const retryStartIndex = Math.max((suggestion.stepIndex || 1) - 1, 0);
+    await runTestFlowCurrentSession({
+      flowId: currentTestFlowId,
+      flowName: `${currentFlow?.name || 'Draft Flow'} (retry from step ${retryStartIndex + 1})`,
+      steps: updatedSteps.slice(retryStartIndex),
+      stepDelayMs: testFlowStepDelayMs,
+    })(dispatch, getState);
+  };
+}
+
 export function exportTestFlowPytestFile(code, suggestedName) {
   return async (dispatch) => {
     dispatch({type: EXPORT_TEST_FLOW_PYTEST_REQUESTED});
@@ -651,9 +700,16 @@ async function executeCurrentSessionStepSequence(
       chunk: `${prefix} Step ${topLevelStepIndex}: ${stepLabel}\n`,
     });
 
+    const startedAt = Date.now();
     try {
       await executeCurrentSessionStep(step, dispatch, getState, topLevelStepIndex, stepDelayMs, {
         runId: context.runId,
+      });
+      await logPluginHealingForStep(step, dispatch, getState, {
+        runId: context.runId,
+        startedAt,
+        stepIndex: topLevelStepIndex,
+        retryable: false,
       });
       dispatch({
         type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
@@ -661,6 +717,12 @@ async function executeCurrentSessionStepSequence(
         chunk: `${prefix} Step ${topLevelStepIndex}: passed\n`,
       });
     } catch (err) {
+      await logPluginHealingForStep(step, dispatch, getState, {
+        runId: context.runId,
+        startedAt,
+        stepIndex: topLevelStepIndex,
+        retryable: true,
+      });
       const stepError = new Error(err?.errorReason || err?.message || String(err));
       Object.assign(stepError, {
         failedStepIndex: topLevelStepIndex,
@@ -686,6 +748,152 @@ async function executeCurrentSessionStepSequence(
         chunk: '\n',
       });
     }
+  }
+}
+
+function getStepHealingLocator(step = {}) {
+  return step.condition?.locator || step.locator || null;
+}
+
+function normalizeLocator(locator = {}) {
+  if (!locator?.strategy) {
+    return null;
+  }
+
+  return {
+    strategy: locator.strategy,
+    selector: locator.selector ?? locator.value,
+  };
+}
+
+function locatorsEqual(left, right) {
+  const normalizedLeft = normalizeLocator(left);
+  const normalizedRight = normalizeLocator(right);
+  return (
+    normalizedLeft?.strategy === normalizedRight?.strategy &&
+    normalizedLeft?.selector === normalizedRight?.selector
+  );
+}
+
+function formatHealingLocator(locator = {}) {
+  const normalized = normalizeLocator(locator);
+  return normalized ? `${normalized.strategy} = ${normalized.selector}` : 'unknown locator';
+}
+
+function getReliabilityDoctorStateUrls(serverDetails = {}) {
+  const serverUrl = serverDetails.serverUrl;
+  if (!serverUrl) {
+    return [];
+  }
+
+  try {
+    const url = new URL(serverUrl);
+    const rootUrl = `${url.origin}/reliability-doctor/api/state`;
+    const serverPath = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '');
+    const pathUrl = `${url.origin}${serverPath}/reliability-doctor/api/state`;
+    return [...new Set([rootUrl, pathUrl])];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchReliabilityDoctorState(serverDetails) {
+  for (const url of getReliabilityDoctorStateUrls(serverDetails)) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function eventIsFresh(event, startedAt) {
+  const timestamp = Date.parse(event?.timestamp || '');
+  return Number.isFinite(timestamp) ? timestamp >= startedAt - 1000 : true;
+}
+
+function findLatestHealingEvent(events = [], originalLocator, startedAt) {
+  return [...events]
+    .reverse()
+    .find(
+      (event) =>
+        ['healed', 'suggested_only'].includes(event.status) &&
+        locatorsEqual(event.locator, originalLocator) &&
+        event.healedLocator?.strategy &&
+        eventIsFresh(event, startedAt),
+    );
+}
+
+async function logPluginHealingForStep(
+  step,
+  dispatch,
+  getState,
+  {runId, startedAt, stepIndex, retryable = false} = {},
+) {
+  const originalLocator = getStepHealingLocator(step);
+  if (!originalLocator) {
+    return;
+  }
+
+  const state = await fetchReliabilityDoctorState(getState().inspector.serverDetails);
+  const event = findLatestHealingEvent(state?.events, originalLocator, startedAt);
+  if (!event) {
+    return;
+  }
+
+  const confidence =
+    typeof event.confidence === 'number' ? `${Math.round(event.confidence * 100)}%` : 'unknown';
+  const reason = event.reasons?.[0] || event.rootCause || event.status;
+  const messagePrefix =
+    event.status === 'healed'
+      ? '[reliability-doctor] Auto-healed locator'
+      : '[reliability-doctor] Suggested locator';
+
+  dispatch({
+    type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
+    runId,
+    chunk:
+      `${messagePrefix}: ${formatHealingLocator(event.locator)} -> ` +
+      `${formatHealingLocator(event.healedLocator)} (${confidence} confidence)` +
+      `${reason ? `\n[reliability-doctor] Reason: ${reason}` : ''}\n`,
+  });
+
+  if (event.status === 'healed' && step.id) {
+    dispatch({
+      type: UPDATE_TEST_FLOW_STEP,
+      stepId: step.id,
+      updates: {
+        locator: {
+          strategy: event.healedLocator.strategy,
+          value: event.healedLocator.selector,
+        },
+        healing: {
+          status: event.status,
+          confidence: event.confidence,
+          reason,
+          originalLocator: normalizeLocator(event.locator),
+          appliedAt: Date.now(),
+        },
+      },
+    });
+  }
+
+  if (event.status === 'suggested_only' && retryable && step.id) {
+    dispatch({
+      type: SET_TEST_FLOW_HEALING_SUGGESTION,
+      suggestion: {
+        stepId: step.id,
+        stepIndex,
+        status: event.status,
+        confidence: event.confidence,
+        reason,
+        originalLocator: normalizeLocator(event.locator),
+        healedLocator: normalizeLocator(event.healedLocator),
+      },
+    });
   }
 }
 

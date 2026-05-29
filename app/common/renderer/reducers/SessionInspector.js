@@ -1,6 +1,5 @@
 import _ from 'lodash';
 
-import {DEFAULT_TEST_FLOW_STEP_DELAY_MS} from '../lib/test-flow-recorder/common.js';
 import {
   ADD_ASSIGNED_VAR_CACHE,
   APPEND_TEST_FLOW_ACTION_STEP,
@@ -15,6 +14,7 @@ import {
   CLEAR_SEARCHED_FOR_ELEMENT_BOUNDS,
   CLEAR_TAP_COORDINATES,
   CLEAR_TEST_FLOW,
+  CLEAR_TEST_FLOW_HEALING_SUGGESTION,
   CLEAR_TEST_FLOW_PYTEST_OUTPUT,
   CREATE_NEW_TEST_FLOW,
   DELETE_SAVED_GESTURES_DONE,
@@ -95,6 +95,7 @@ import {
   SET_SIRI_COMMAND_VALUE,
   SET_SOURCE_AND_SCREENSHOT,
   SET_TEST_FLOW_EXPORT_FORMAT,
+  SET_TEST_FLOW_HEALING_SUGGESTION,
   SET_TEST_FLOW_STEP_DELAY_MS,
   SET_USER_WAIT_TIMEOUT,
   SHOW_GESTURE_ACTION,
@@ -120,6 +121,7 @@ import {
   NATIVE_APP,
   TEST_FLOW_EXPORT_FORMATS,
 } from '../constants/session-inspector.js';
+import {DEFAULT_TEST_FLOW_STEP_DELAY_MS} from '../lib/test-flow-recorder/common.js';
 
 const TEST_FLOW_DRAFT_KEY = 'draft';
 
@@ -204,6 +206,7 @@ const INITIAL_STATE = {
   testFlowPytestOutput: '',
   testFlowCurrentRunId: null,
   testFlowRunHistoryByFlowKey: {},
+  testFlowHealingSuggestion: null,
   testFlowRuntimeError: null,
   clientFramework: CLIENT_FRAMEWORKS.JAVA_JUNIT4,
   serverDetails: {},
@@ -393,6 +396,7 @@ export default function inspector(state = INITIAL_STATE, action) {
       return {
         ...state,
         recordedTestFlowSteps: [],
+        testFlowHealingSuggestion: null,
       };
 
     case APPEND_TEST_FLOW_ACTION_STEP:
@@ -409,6 +413,18 @@ export default function inspector(state = INITIAL_STATE, action) {
         recordedTestFlowSteps: state.recordedTestFlowSteps.map((step) =>
           step.id === action.stepId ? {...step, ...action.updates} : step,
         ),
+      };
+
+    case SET_TEST_FLOW_HEALING_SUGGESTION:
+      return {
+        ...state,
+        testFlowHealingSuggestion: action.suggestion,
+      };
+
+    case CLEAR_TEST_FLOW_HEALING_SUGGESTION:
+      return {
+        ...state,
+        testFlowHealingSuggestion: null,
       };
 
     case REMOVE_TEST_FLOW_STEP:
@@ -533,6 +549,7 @@ export default function inspector(state = INITIAL_STATE, action) {
         testFlowCurrentSessionResult: null,
         testFlowCurrentRunId: run.id,
         testFlowRunHistoryByFlowKey: appendTestFlowRun(state.testFlowRunHistoryByFlowKey, run),
+        testFlowHealingSuggestion: null,
         testFlowRuntimeError: null,
       };
     }
