@@ -168,6 +168,7 @@ export const SET_AUTO_SESSION_RESTART = 'SET_AUTO_SESSION_RESTART';
 
 const KEEP_ALIVE_PING_INTERVAL = 20 * 1000;
 const NO_NEW_COMMAND_LIMIT = 24 * 60 * 60 * 1000; // Set timeout to 24 hours
+const TEST_FLOW_WAIT_POLL_MS = 100;
 
 // A debounced function that calls findElement and gets info about the element
 const findElement = _.debounce(async function (strategyMap, dispatch, getState, path) {
@@ -670,15 +671,6 @@ async function executeCurrentSessionStepSequence(
       throw stepError;
     }
 
-    if (stepDelayMs > 0 && index < steps.length - 1) {
-      dispatch({
-        type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
-        runId: context.runId,
-        chunk: `${prefix} Waiting ${stepDelayMs}ms before next step\n`,
-      });
-      await waitForTestFlowDelay(stepDelayMs);
-    }
-
     if (isTopLevelStep) {
       dispatch({
         type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
@@ -698,7 +690,7 @@ async function executeCurrentSessionStep(
   context = {},
 ) {
   if (step.type === 'assertion') {
-    await executeCurrentSessionAssertion(step, dispatch, getState);
+    await executeCurrentSessionAssertion(step, dispatch, getState, stepDelayMs);
     return;
   }
 
@@ -707,6 +699,7 @@ async function executeCurrentSessionStep(
       step,
       dispatch,
       getState,
+      stepDelayMs,
     );
     const branchSteps = branchConditionPassed ? step.thenSteps || [] : step.elseSteps || [];
     dispatch({
@@ -722,13 +715,15 @@ async function executeCurrentSessionStep(
     return;
   }
 
-  await executeCurrentSessionAction(step, dispatch, getState);
+  await executeCurrentSessionAction(step, dispatch, getState, stepDelayMs);
 }
 
-async function executeCurrentSessionAction(step, dispatch, getState) {
+async function executeCurrentSessionAction(step, dispatch, getState, stepDelayMs) {
   switch (step.action) {
     case 'tap': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, dispatch, getState);
+      const elementId = await resolveCurrentSessionElementId(step.locator, getState, stepDelayMs, {
+        requireVisible: true,
+      });
       await callClientMethod({
         methodName: 'elementClick',
         elementId,
@@ -739,7 +734,9 @@ async function executeCurrentSessionAction(step, dispatch, getState) {
     }
 
     case 'sendKeys': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, dispatch, getState);
+      const elementId = await resolveCurrentSessionElementId(step.locator, getState, stepDelayMs, {
+        requireVisible: true,
+      });
       await callClientMethod({
         methodName: 'elementSendKeys',
         elementId,
@@ -751,7 +748,9 @@ async function executeCurrentSessionAction(step, dispatch, getState) {
     }
 
     case 'clear': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, dispatch, getState);
+      const elementId = await resolveCurrentSessionElementId(step.locator, getState, stepDelayMs, {
+        requireVisible: true,
+      });
       await callClientMethod({
         methodName: 'elementClear',
         elementId,
@@ -797,10 +796,10 @@ async function executeCurrentSessionAction(step, dispatch, getState) {
   }
 }
 
-async function executeCurrentSessionAssertion(step, _dispatch, getState) {
+async function executeCurrentSessionAssertion(step, _dispatch, getState, stepDelayMs) {
   switch (step.assertion) {
     case 'exists': {
-      const elements = await findCurrentSessionElements(step.locator, getState);
+      const elements = await waitForCurrentSessionElements(step.locator, getState, stepDelayMs);
       if (!elements.length) {
         throw new Error('Expected element to exist');
       }
@@ -808,49 +807,63 @@ async function executeCurrentSessionAssertion(step, _dispatch, getState) {
     }
 
     case 'visible': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, _dispatch, getState);
-      if (!(await getState().inspector.driver.isElementDisplayed(elementId))) {
-        throw new Error('Expected element to be visible');
-      }
+      await waitForCurrentSessionElementState(
+        step.locator,
+        getState,
+        stepDelayMs,
+        async (elementId) => await getState().inspector.driver.isElementDisplayed(elementId),
+        'Expected element to be visible',
+      );
       return;
     }
 
     case 'enabled': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, _dispatch, getState);
-      if (!(await getState().inspector.driver.isElementEnabled(elementId))) {
-        throw new Error('Expected element to be enabled');
-      }
+      await waitForCurrentSessionElementState(
+        step.locator,
+        getState,
+        stepDelayMs,
+        async (elementId) => await getState().inspector.driver.isElementEnabled(elementId),
+        'Expected element to be enabled',
+      );
       return;
     }
 
     case 'disabled': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, _dispatch, getState);
-      if (await getState().inspector.driver.isElementEnabled(elementId)) {
-        throw new Error('Expected element to be disabled');
-      }
+      await waitForCurrentSessionElementState(
+        step.locator,
+        getState,
+        stepDelayMs,
+        async (elementId) => !(await getState().inspector.driver.isElementEnabled(elementId)),
+        'Expected element to be disabled',
+      );
       return;
     }
 
     case 'textEquals': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, _dispatch, getState);
-      const actualText = await getState().inspector.driver.getElementText(elementId);
-      if (actualText !== (step.expectedText || '')) {
-        throw new Error(`Expected text '${step.expectedText || ''}' but received '${actualText}'`);
-      }
+      await waitForCurrentSessionElementState(
+        step.locator,
+        getState,
+        stepDelayMs,
+        async (elementId) =>
+          (await getState().inspector.driver.getElementText(elementId)) ===
+          (step.expectedText || ''),
+        `Expected text '${step.expectedText || ''}'`,
+      );
       return;
     }
 
     case 'attributeEquals': {
-      const elementId = await resolveCurrentSessionElementId(step.locator, _dispatch, getState);
-      const actualValue = await getState().inspector.driver.getElementAttribute(
-        elementId,
-        step.attributeName || '',
+      await waitForCurrentSessionElementState(
+        step.locator,
+        getState,
+        stepDelayMs,
+        async (elementId) =>
+          (await getState().inspector.driver.getElementAttribute(
+            elementId,
+            step.attributeName || '',
+          )) === (step.expectedValue || ''),
+        `Expected attribute '${step.attributeName || ''}' to equal '${step.expectedValue || ''}'`,
       );
-      if (actualValue !== (step.expectedValue || '')) {
-        throw new Error(
-          `Expected attribute '${step.attributeName || ''}' to equal '${step.expectedValue || ''}' but received '${actualValue}'`,
-        );
-      }
       return;
     }
 
@@ -859,24 +872,25 @@ async function executeCurrentSessionAssertion(step, _dispatch, getState) {
   }
 }
 
-async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState) {
+async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState, stepDelayMs) {
   const conditionLocator = step.condition?.locator || step.locator;
   const conditionType = step.condition?.assertion || 'exists';
 
   switch (conditionType) {
     case 'exists': {
-      const elements = await findCurrentSessionElements(conditionLocator, getState);
+      const elements = await waitForCurrentSessionElements(conditionLocator, getState, stepDelayMs);
       return elements.length > 0;
     }
 
     case 'visible': {
-      const elementId = await resolveCurrentSessionElementId(conditionLocator, _dispatch, getState).catch(
-        () => null,
+      return Boolean(
+        await waitForCurrentSessionElementState(
+          conditionLocator,
+          getState,
+          stepDelayMs,
+          async (elementId) => await getState().inspector.driver.isElementDisplayed(elementId),
+        ).catch(() => null),
       );
-      if (!elementId) {
-        return false;
-      }
-      return await getState().inspector.driver.isElementDisplayed(elementId);
     }
 
     default:
@@ -884,23 +898,26 @@ async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState) 
   }
 }
 
-async function resolveCurrentSessionElementId(locator, dispatch, getState) {
+async function resolveCurrentSessionElementId(
+  locator,
+  getState,
+  timeoutMs = 0,
+  {requireVisible = false} = {},
+) {
   if (!locator?.strategy || !locator?.value) {
     throw new Error('Step is missing a valid locator');
   }
 
-  const result = await callClientMethod({
-    strategy: locator.strategy,
-    selector: locator.value,
-    skipRefresh: true,
-    skipRecord: true,
-  })(dispatch, getState);
-
-  if (!result?.elementId) {
-    throw new Error(`Element not found for locator ${locator.strategy} = ${locator.value}`);
-  }
-
-  return result.elementId;
+  const errorMessage = `Element not found for locator ${locator.strategy} = ${locator.value}`;
+  return await waitForCurrentSessionElementState(
+    locator,
+    getState,
+    timeoutMs,
+    requireVisible
+      ? async (elementId) => await getState().inspector.driver.isElementDisplayed(elementId)
+      : null,
+    errorMessage,
+  );
 }
 
 async function findCurrentSessionElement(locator, getState) {
@@ -917,6 +934,73 @@ async function findCurrentSessionElements(locator, getState) {
   }
 
   return await getState().inspector.driver.findElements(locator.strategy, locator.value);
+}
+
+async function waitForCurrentSessionElements(locator, getState, timeoutMs = 0) {
+  if (timeoutMs <= 0) {
+    return await findCurrentSessionElements(locator, getState);
+  }
+
+  return (
+    (await waitForCurrentSessionCondition(async () => {
+      const elements = await findCurrentSessionElements(locator, getState);
+      return elements.length ? elements : null;
+    }, timeoutMs).catch(() => null)) || []
+  );
+}
+
+async function waitForCurrentSessionElementState(
+  locator,
+  getState,
+  timeoutMs = 0,
+  predicate = null,
+  errorMessage = null,
+) {
+  return await waitForCurrentSessionCondition(
+    async () => {
+      const element = await findCurrentSessionElement(locator, getState);
+      const elementId = element?.elementId;
+      if (!elementId) {
+        return null;
+      }
+      if (predicate && !(await predicate(elementId))) {
+        return null;
+      }
+      return elementId;
+    },
+    timeoutMs,
+    errorMessage || `Element not found for locator ${locator?.strategy} = ${locator?.value}`,
+  );
+}
+
+async function waitForCurrentSessionCondition(condition, timeoutMs = 0, errorMessage = null) {
+  const deadline = Date.now() + Math.max(timeoutMs, 0);
+  let lastError = null;
+
+  do {
+    try {
+      const result = await condition();
+      if (result) {
+        return result;
+      }
+    } catch (err) {
+      lastError = err;
+    }
+
+    const remainingMs = deadline - Date.now();
+    if (timeoutMs <= 0 || remainingMs <= 0) {
+      break;
+    }
+    await waitForTestFlowDelay(Math.min(TEST_FLOW_WAIT_POLL_MS, remainingMs));
+  } while (Date.now() <= deadline);
+
+  if (errorMessage) {
+    throw new Error(errorMessage);
+  }
+  if (lastError) {
+    throw lastError;
+  }
+  throw new Error('Timed out waiting for current-session condition');
 }
 
 async function performCurrentSessionViewportScroll(direction = 'down', getState) {
@@ -968,7 +1052,13 @@ function waitForTestFlowDelay(delayMs) {
 
 async function refreshInspectorAfterCurrentSessionRun(dispatch, getState) {
   try {
-    await applyClientMethod({methodName: 'getPageSource', skipRecord: true})(dispatch, getState);
+    // Wait a bit more to ensure the device UI is stable after the run
+    await waitForTestFlowDelay(1000);
+    await applyClientMethod({
+      methodName: 'getPageSource',
+      skipRecord: true,
+      forceRefresh: true,
+    })(dispatch, getState);
   } catch {}
 }
 
@@ -1671,11 +1761,12 @@ export function callClientMethod(params) {
     params.autoSessionRestart = autoSessionRestart;
 
     // don't retrieve screenshot if we're already using the mjpeg stream
-    if (isUsingMjpegMode) {
+    // unless we're forcing a refresh
+    if (isUsingMjpegMode && !params.forceRefresh) {
       params.skipScreenshot = true;
     }
 
-    if (!isSourceRefreshOn) {
+    if (!isSourceRefreshOn && !params.forceRefresh) {
       params.skipRefresh = true;
     }
 
