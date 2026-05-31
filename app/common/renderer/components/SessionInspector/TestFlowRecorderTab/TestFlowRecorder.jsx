@@ -249,6 +249,7 @@ const TestFlowRecorder = (props) => {
     appendTestFlowActionStep,
     appendTestFlowAssertionStep,
     appendTestFlowBranchStep,
+    applyTestFlowHealingSuggestion,
     applyClientMethod,
     clearTestFlow,
     clearTestFlowPytestOutput,
@@ -275,6 +276,7 @@ const TestFlowRecorder = (props) => {
     startTestFlowRecording,
     testFlowExportFilePath,
     testFlowExportFormat,
+    testFlowHealingSuggestion,
     testFlowStepDelayMs,
     testFlowRunHistoryByFlowKey = {},
     updateTestFlowStep,
@@ -519,6 +521,9 @@ const TestFlowRecorder = (props) => {
     value: run.id,
     label: getRunHistoryLabel(run, t),
   }));
+  const healingSuggestionText = testFlowHealingSuggestion
+    ? `${testFlowHealingSuggestion.originalLocator?.strategy} = ${testFlowHealingSuggestion.originalLocator?.selector} -> ${testFlowHealingSuggestion.healedLocator?.strategy} = ${testFlowHealingSuggestion.healedLocator?.selector}`
+    : '';
 
   const pytestCode = getPytestTestFlowCode({
     serverUrl: serverDetails?.serverUrl,
@@ -665,8 +670,8 @@ const TestFlowRecorder = (props) => {
         assertion: 'visible',
         locator: selectedElementLocator,
       },
-      thenSteps: [],
-      elseSteps: [],
+      thenSteps: [{type: 'action', action: 'custom', name: 'Then branch'}],
+      elseSteps: [{type: 'action', action: 'custom', name: 'Else branch'}],
     });
   };
 
@@ -1305,6 +1310,36 @@ const TestFlowRecorder = (props) => {
                 </div>
                 <div className={styles.delaySettingHint}>{t('0 disables extra waiting')}</div>
               </div>
+
+              {testFlowHealingSuggestion && (
+                <Alert
+                  type="warning"
+                  showIcon
+                  message={t('Reliability Doctor suggested a locator repair')}
+                  description={
+                    <Space direction="vertical" size={4}>
+                      <code>{healingSuggestionText}</code>
+                      {testFlowHealingSuggestion.reason && (
+                        <span>{testFlowHealingSuggestion.reason}</span>
+                      )}
+                    </Space>
+                  }
+                  action={
+                    <Button
+                      size="small"
+                      type={BUTTON.PRIMARY}
+                      onClick={() => {
+                        setRightPanelTab('logs');
+                        setShowResultSummary(true);
+                        applyTestFlowHealingSuggestion(testFlowHealingSuggestion);
+                      }}
+                      disabled={isRunningAnyTestFlow}
+                    >
+                      {t('Apply and retry')}
+                    </Button>
+                  }
+                />
+              )}
 
               {/* Segmented Selector for output */}
               <div className={styles.outputSelectorRow}>

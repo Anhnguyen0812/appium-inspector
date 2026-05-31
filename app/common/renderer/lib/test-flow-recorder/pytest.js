@@ -26,6 +26,7 @@ export function getPytestTestFlowCode({serverUrl, sessionCaps, steps = [], stepD
     : ['        # Start recording to generate a flow here'];
 
   return [
+    ...(shouldImportTime ? ['import time'] : []),
     'import pytest',
     'from appium import webdriver',
     'from appium.options.common import AppiumOptions',
@@ -187,6 +188,10 @@ function getStepSequenceLines(steps, indentLevel, stepDelayMs, includeHeaders = 
     }
 
     lines.push(...getStepLines(step, indentLevel, stepDelayMs));
+
+    if (stepDelayMs > 0 && index < steps.length - 1) {
+      lines.push(...withIndent([`time.sleep(${formatDelaySeconds(stepDelayMs)})`], indentLevel));
+    }
 
     return lines;
   });

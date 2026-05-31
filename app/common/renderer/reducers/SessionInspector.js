@@ -95,6 +95,7 @@ import {
   SET_SIRI_COMMAND_VALUE,
   SET_SOURCE_AND_SCREENSHOT,
   SET_TEST_FLOW_EXPORT_FORMAT,
+  SET_TEST_FLOW_HEALING_SUGGESTION,
   SET_TEST_FLOW_STEP_DELAY_MS,
   SET_USER_WAIT_TIMEOUT,
   SHOW_GESTURE_ACTION,
@@ -120,6 +121,55 @@ import {
   NATIVE_APP,
   TEST_FLOW_EXPORT_FORMATS,
 } from '../constants/session-inspector.js';
+import {DEFAULT_TEST_FLOW_STEP_DELAY_MS} from '../lib/test-flow-recorder/common.js';
+
+const TEST_FLOW_DRAFT_KEY = 'draft';
+
+function appendTestFlowRun(historyByFlowKey, run) {
+  const flowKey = run.flowKey || TEST_FLOW_DRAFT_KEY;
+  const currentRuns = historyByFlowKey[flowKey] || [];
+  return {
+    ...historyByFlowKey,
+    [flowKey]: [run, ...currentRuns.filter(({id}) => id !== run.id)],
+  };
+}
+
+function updateTestFlowRun(historyByFlowKey, runId, updater) {
+  if (!runId) {
+    return historyByFlowKey;
+  }
+
+  let hasUpdated = false;
+  const nextHistory = Object.fromEntries(
+    Object.entries(historyByFlowKey).map(([flowKey, runs]) => [
+      flowKey,
+      runs.map((run) => {
+        if (run.id !== runId) {
+          return run;
+        }
+
+        hasUpdated = true;
+        return updater(run);
+      }),
+    ]),
+  );
+
+  return hasUpdated ? nextHistory : historyByFlowKey;
+}
+
+function clearTestFlowRunHistory(historyByFlowKey, flowKey) {
+  if (!flowKey) {
+    return {};
+  }
+
+  if (!historyByFlowKey[flowKey]) {
+    return historyByFlowKey;
+  }
+
+  const nextHistory = {...historyByFlowKey};
+  delete nextHistory[flowKey];
+  return nextHistory;
+}
 
 const TEST_FLOW_DRAFT_KEY = 'draft';
 
@@ -204,6 +254,7 @@ const INITIAL_STATE = {
   testFlowPytestOutput: '',
   testFlowCurrentRunId: null,
   testFlowRunHistoryByFlowKey: {},
+  testFlowHealingSuggestion: null,
   testFlowRuntimeError: null,
   clientFramework: CLIENT_FRAMEWORKS.JAVA_JUNIT4,
   serverDetails: {},
@@ -393,6 +444,7 @@ export default function inspector(state = INITIAL_STATE, action) {
       return {
         ...state,
         recordedTestFlowSteps: [],
+        testFlowHealingSuggestion: null,
       };
 
     case APPEND_TEST_FLOW_ACTION_STEP:
@@ -409,6 +461,18 @@ export default function inspector(state = INITIAL_STATE, action) {
         recordedTestFlowSteps: state.recordedTestFlowSteps.map((step) =>
           step.id === action.stepId ? {...step, ...action.updates} : step,
         ),
+      };
+
+    case SET_TEST_FLOW_HEALING_SUGGESTION:
+      return {
+        ...state,
+        testFlowHealingSuggestion: action.suggestion,
+      };
+
+    case CLEAR_TEST_FLOW_HEALING_SUGGESTION:
+      return {
+        ...state,
+        testFlowHealingSuggestion: null,
       };
 
     case REMOVE_TEST_FLOW_STEP:
@@ -533,6 +597,7 @@ export default function inspector(state = INITIAL_STATE, action) {
         testFlowCurrentSessionResult: null,
         testFlowCurrentRunId: run.id,
         testFlowRunHistoryByFlowKey: appendTestFlowRun(state.testFlowRunHistoryByFlowKey, run),
+        testFlowHealingSuggestion: null,
         testFlowRuntimeError: null,
       };
     }

@@ -84,6 +84,8 @@ export const RUN_TEST_FLOW_CURRENT_SESSION_REQUESTED = 'RUN_TEST_FLOW_CURRENT_SE
 export const RUN_TEST_FLOW_CURRENT_SESSION_COMPLETED = 'RUN_TEST_FLOW_CURRENT_SESSION_COMPLETED';
 export const RUN_TEST_FLOW_CURRENT_SESSION_FAILED = 'RUN_TEST_FLOW_CURRENT_SESSION_FAILED';
 export const APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT = 'APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT';
+export const SET_TEST_FLOW_HEALING_SUGGESTION = 'SET_TEST_FLOW_HEALING_SUGGESTION';
+export const CLEAR_TEST_FLOW_HEALING_SUGGESTION = 'CLEAR_TEST_FLOW_HEALING_SUGGESTION';
 export const EXPORT_TEST_FLOW_PYTEST_REQUESTED = 'EXPORT_TEST_FLOW_PYTEST_REQUESTED';
 export const EXPORT_TEST_FLOW_PYTEST_COMPLETED = 'EXPORT_TEST_FLOW_PYTEST_COMPLETED';
 export const EXPORT_TEST_FLOW_PYTEST_FAILED = 'EXPORT_TEST_FLOW_PYTEST_FAILED';
@@ -550,6 +552,53 @@ export function runTestFlowCurrentSession(runConfigOrSteps, stepDelayMs) {
   };
 }
 
+export function applyTestFlowHealingSuggestion(suggestion) {
+  return async (dispatch, getState) => {
+    if (!suggestion?.stepId || !suggestion?.healedLocator?.strategy) {
+      return;
+    }
+
+    const locator = {
+      strategy: suggestion.healedLocator.strategy,
+      value: suggestion.healedLocator.selector,
+    };
+    dispatch({
+      type: UPDATE_TEST_FLOW_STEP,
+      stepId: suggestion.stepId,
+      updates: {
+        locator,
+        healing: {
+          status: suggestion.status,
+          confidence: suggestion.confidence,
+          reason: suggestion.reason,
+          originalLocator: suggestion.originalLocator,
+          appliedAt: Date.now(),
+        },
+      },
+    });
+    dispatch({type: CLEAR_TEST_FLOW_HEALING_SUGGESTION});
+
+    const {recordedTestFlowSteps, testFlowStepDelayMs, currentTestFlowId, savedTestFlows} =
+      getState().inspector;
+    const currentFlow = savedTestFlows?.find((flow) => flow.id === currentTestFlowId);
+    const updatedSteps = recordedTestFlowSteps.map((step) =>
+      step.id === suggestion.stepId
+        ? {
+            ...step,
+            locator,
+          }
+        : step,
+    );
+    const retryStartIndex = Math.max((suggestion.stepIndex || 1) - 1, 0);
+    await runTestFlowCurrentSession({
+      flowId: currentTestFlowId,
+      flowName: `${currentFlow?.name || 'Draft Flow'} (retry from step ${retryStartIndex + 1})`,
+      steps: updatedSteps.slice(retryStartIndex),
+      stepDelayMs: testFlowStepDelayMs,
+    })(dispatch, getState);
+  };
+}
+
 export function exportTestFlowPytestFile(code, suggestedName) {
   return async (dispatch) => {
     dispatch({type: EXPORT_TEST_FLOW_PYTEST_REQUESTED});
@@ -652,9 +701,16 @@ async function executeCurrentSessionStepSequence(
       chunk: `${prefix} Step ${topLevelStepIndex}: ${stepLabel}\n`,
     });
 
+    const startedAt = Date.now();
     try {
       await executeCurrentSessionStep(step, dispatch, getState, topLevelStepIndex, stepDelayMs, {
         runId: context.runId,
+      });
+      await logPluginHealingForStep(step, dispatch, getState, {
+        runId: context.runId,
+        startedAt,
+        stepIndex: topLevelStepIndex,
+        retryable: false,
       });
       dispatch({
         type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
@@ -662,6 +718,12 @@ async function executeCurrentSessionStepSequence(
         chunk: `${prefix} Step ${topLevelStepIndex}: passed\n`,
       });
     } catch (err) {
+      await logPluginHealingForStep(step, dispatch, getState, {
+        runId: context.runId,
+        startedAt,
+        stepIndex: topLevelStepIndex,
+        retryable: true,
+      });
       const stepError = new Error(err?.errorReason || err?.message || String(err));
       Object.assign(stepError, {
         failedStepIndex: topLevelStepIndex,
@@ -671,6 +733,15 @@ async function executeCurrentSessionStepSequence(
       throw stepError;
     }
 
+    if (stepDelayMs > 0 && index < steps.length - 1) {
+      dispatch({
+        type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
+        runId: context.runId,
+        chunk: `${prefix} Waiting ${stepDelayMs}ms before next step\n`,
+      });
+      await waitForTestFlowDelay(stepDelayMs);
+    }
+
     if (isTopLevelStep) {
       dispatch({
         type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
@@ -678,6 +749,152 @@ async function executeCurrentSessionStepSequence(
         chunk: '\n',
       });
     }
+  }
+}
+
+function getStepHealingLocator(step = {}) {
+  return step.condition?.locator || step.locator || null;
+}
+
+function normalizeLocator(locator = {}) {
+  if (!locator?.strategy) {
+    return null;
+  }
+
+  return {
+    strategy: locator.strategy,
+    selector: locator.selector ?? locator.value,
+  };
+}
+
+function locatorsEqual(left, right) {
+  const normalizedLeft = normalizeLocator(left);
+  const normalizedRight = normalizeLocator(right);
+  return (
+    normalizedLeft?.strategy === normalizedRight?.strategy &&
+    normalizedLeft?.selector === normalizedRight?.selector
+  );
+}
+
+function formatHealingLocator(locator = {}) {
+  const normalized = normalizeLocator(locator);
+  return normalized ? `${normalized.strategy} = ${normalized.selector}` : 'unknown locator';
+}
+
+function getReliabilityDoctorStateUrls(serverDetails = {}) {
+  const serverUrl = serverDetails.serverUrl;
+  if (!serverUrl) {
+    return [];
+  }
+
+  try {
+    const url = new URL(serverUrl);
+    const rootUrl = `${url.origin}/reliability-doctor/api/state`;
+    const serverPath = url.pathname === '/' ? '' : url.pathname.replace(/\/$/, '');
+    const pathUrl = `${url.origin}${serverPath}/reliability-doctor/api/state`;
+    return [...new Set([rootUrl, pathUrl])];
+  } catch {
+    return [];
+  }
+}
+
+async function fetchReliabilityDoctorState(serverDetails) {
+  for (const url of getReliabilityDoctorStateUrls(serverDetails)) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        return await response.json();
+      }
+    } catch {}
+  }
+
+  return null;
+}
+
+function eventIsFresh(event, startedAt) {
+  const timestamp = Date.parse(event?.timestamp || '');
+  return Number.isFinite(timestamp) ? timestamp >= startedAt - 1000 : true;
+}
+
+function findLatestHealingEvent(events = [], originalLocator, startedAt) {
+  return [...events]
+    .reverse()
+    .find(
+      (event) =>
+        ['healed', 'suggested_only'].includes(event.status) &&
+        locatorsEqual(event.locator, originalLocator) &&
+        event.healedLocator?.strategy &&
+        eventIsFresh(event, startedAt),
+    );
+}
+
+async function logPluginHealingForStep(
+  step,
+  dispatch,
+  getState,
+  {runId, startedAt, stepIndex, retryable = false} = {},
+) {
+  const originalLocator = getStepHealingLocator(step);
+  if (!originalLocator) {
+    return;
+  }
+
+  const state = await fetchReliabilityDoctorState(getState().inspector.serverDetails);
+  const event = findLatestHealingEvent(state?.events, originalLocator, startedAt);
+  if (!event) {
+    return;
+  }
+
+  const confidence =
+    typeof event.confidence === 'number' ? `${Math.round(event.confidence * 100)}%` : 'unknown';
+  const reason = event.reasons?.[0] || event.rootCause || event.status;
+  const messagePrefix =
+    event.status === 'healed'
+      ? '[reliability-doctor] Auto-healed locator'
+      : '[reliability-doctor] Suggested locator';
+
+  dispatch({
+    type: APPEND_TEST_FLOW_CURRENT_SESSION_OUTPUT,
+    runId,
+    chunk:
+      `${messagePrefix}: ${formatHealingLocator(event.locator)} -> ` +
+      `${formatHealingLocator(event.healedLocator)} (${confidence} confidence)` +
+      `${reason ? `\n[reliability-doctor] Reason: ${reason}` : ''}\n`,
+  });
+
+  if (event.status === 'healed' && step.id) {
+    dispatch({
+      type: UPDATE_TEST_FLOW_STEP,
+      stepId: step.id,
+      updates: {
+        locator: {
+          strategy: event.healedLocator.strategy,
+          value: event.healedLocator.selector,
+        },
+        healing: {
+          status: event.status,
+          confidence: event.confidence,
+          reason,
+          originalLocator: normalizeLocator(event.locator),
+          appliedAt: Date.now(),
+        },
+      },
+    });
+  }
+
+  if (event.status === 'suggested_only' && retryable && step.id) {
+    dispatch({
+      type: SET_TEST_FLOW_HEALING_SUGGESTION,
+      suggestion: {
+        stepId: step.id,
+        stepIndex,
+        status: event.status,
+        confidence: event.confidence,
+        reason,
+        originalLocator: normalizeLocator(event.locator),
+        healedLocator: normalizeLocator(event.healedLocator),
+      },
+    });
   }
 }
 
@@ -872,7 +1089,7 @@ async function executeCurrentSessionAssertion(step, _dispatch, getState, stepDel
   }
 }
 
-async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState, stepDelayMs) {
+async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState) {
   const conditionLocator = step.condition?.locator || step.locator;
   const conditionType = step.condition?.assertion || 'exists';
 
@@ -883,14 +1100,13 @@ async function evaluateCurrentSessionBranchCondition(step, _dispatch, getState, 
     }
 
     case 'visible': {
-      return Boolean(
-        await waitForCurrentSessionElementState(
-          conditionLocator,
-          getState,
-          stepDelayMs,
-          async (elementId) => await getState().inspector.driver.isElementDisplayed(elementId),
-        ).catch(() => null),
+      const elementId = await resolveCurrentSessionElementId(conditionLocator, _dispatch, getState).catch(
+        () => null,
       );
+      if (!elementId) {
+        return false;
+      }
+      return await getState().inspector.driver.isElementDisplayed(elementId);
     }
 
     default:
@@ -934,73 +1150,6 @@ async function findCurrentSessionElements(locator, getState) {
   }
 
   return await getState().inspector.driver.findElements(locator.strategy, locator.value);
-}
-
-async function waitForCurrentSessionElements(locator, getState, timeoutMs = 0) {
-  if (timeoutMs <= 0) {
-    return await findCurrentSessionElements(locator, getState);
-  }
-
-  return (
-    (await waitForCurrentSessionCondition(async () => {
-      const elements = await findCurrentSessionElements(locator, getState);
-      return elements.length ? elements : null;
-    }, timeoutMs).catch(() => null)) || []
-  );
-}
-
-async function waitForCurrentSessionElementState(
-  locator,
-  getState,
-  timeoutMs = 0,
-  predicate = null,
-  errorMessage = null,
-) {
-  return await waitForCurrentSessionCondition(
-    async () => {
-      const element = await findCurrentSessionElement(locator, getState);
-      const elementId = element?.elementId;
-      if (!elementId) {
-        return null;
-      }
-      if (predicate && !(await predicate(elementId))) {
-        return null;
-      }
-      return elementId;
-    },
-    timeoutMs,
-    errorMessage || `Element not found for locator ${locator?.strategy} = ${locator?.value}`,
-  );
-}
-
-async function waitForCurrentSessionCondition(condition, timeoutMs = 0, errorMessage = null) {
-  const deadline = Date.now() + Math.max(timeoutMs, 0);
-  let lastError = null;
-
-  do {
-    try {
-      const result = await condition();
-      if (result) {
-        return result;
-      }
-    } catch (err) {
-      lastError = err;
-    }
-
-    const remainingMs = deadline - Date.now();
-    if (timeoutMs <= 0 || remainingMs <= 0) {
-      break;
-    }
-    await waitForTestFlowDelay(Math.min(TEST_FLOW_WAIT_POLL_MS, remainingMs));
-  } while (Date.now() <= deadline);
-
-  if (errorMessage) {
-    throw new Error(errorMessage);
-  }
-  if (lastError) {
-    throw lastError;
-  }
-  throw new Error('Timed out waiting for current-session condition');
 }
 
 async function performCurrentSessionViewportScroll(direction = 'down', getState) {
@@ -1305,6 +1454,31 @@ export function searchForElement(strategy, selector) {
       showError(error, {methodName: 10});
       return [];
     }
+  };
+}
+
+export function selectElementByLocator(strategy, selector) {
+  return async (dispatch, getState) => {
+    dispatch({type: SET_LOCATOR_TEST_STRATEGY, locatorTestStrategy: strategy});
+    dispatch({type: SET_LOCATOR_TEST_VALUE, locatorTestValue: selector});
+
+    const elementIds = await searchForElement(strategy, selector)(dispatch, getState);
+    if (!elementIds.length) {
+      return null;
+    }
+
+    const targetElementId = elementIds[0];
+    await setLocatorTestElement(targetElementId)(dispatch, getState);
+
+    const {sourceJSON, sourceXML, searchedForElementBounds} = getState().inspector;
+    await selectLocatedElement(
+      sourceJSON,
+      sourceXML,
+      searchedForElementBounds,
+      targetElementId,
+    )(dispatch, getState);
+
+    return targetElementId;
   };
 }
 

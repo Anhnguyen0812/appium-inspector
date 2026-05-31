@@ -3,7 +3,7 @@ import {describe, expect, it} from 'vitest';
 import {getPytestTestFlowCode} from '../../app/common/renderer/lib/test-flow-recorder/pytest.js';
 
 describe('test-flow-recorder/pytest.js', function () {
-  it('should wait for elements before top-level steps when timeout is enabled', function () {
+  it('should insert time.sleep between top-level steps when delay is enabled', function () {
     const code = getPytestTestFlowCode({
       steps: [
         {
@@ -22,22 +22,14 @@ describe('test-flow-recorder/pytest.js', function () {
       stepDelayMs: 750,
     });
 
-    expect(code).toContain('from selenium.common.exceptions import TimeoutException');
-    expect(code).toContain('def is_present(driver, locator, timeout):');
-    expect(code).toContain('from selenium.webdriver.support import expected_conditions as EC');
-    expect(code).toContain('from selenium.webdriver.support.ui import WebDriverWait');
+    expect(code).toContain('import time');
     expect(code).toContain('# [Step 1] Tap login');
-    expect(code).toContain(
-      'element = WebDriverWait(driver, 0.75).until(EC.visibility_of_element_located((AppiumBy.ACCESSIBILITY_ID, "login-btn")))',
-    );
-    expect(code).toContain('element.click()');
-    expect(code).toContain(
-      'assert WebDriverWait(driver, 0.75).until(EC.presence_of_element_located((AppiumBy.ACCESSIBILITY_ID, "welcome-text"))), "Expected element to exist"',
-    );
+    expect(code).toContain('driver.find_element(AppiumBy.ACCESSIBILITY_ID, "login-btn").click()');
+    expect(code).toContain('time.sleep(0.75)');
     expect(code).toContain('# [Step 2] Verify welcome');
   });
 
-  it('should wait inside branch child steps instead of sleeping', function () {
+  it('should insert time.sleep between branch child steps', function () {
     const code = getPytestTestFlowCode({
       steps: [
         {
