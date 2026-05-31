@@ -3,7 +3,7 @@ import {describe, expect, it} from 'vitest';
 import {getPytestTestFlowCode} from '../../app/common/renderer/lib/test-flow-recorder/pytest.js';
 
 describe('test-flow-recorder/pytest.js', function () {
-  it('should insert time.sleep between top-level steps when delay is enabled', function () {
+  it('should wait for elements before top-level steps when timeout is enabled', function () {
     const code = getPytestTestFlowCode({
       steps: [
         {
@@ -22,14 +22,22 @@ describe('test-flow-recorder/pytest.js', function () {
       stepDelayMs: 750,
     });
 
-    expect(code).toContain('import time');
+    expect(code).toContain('from selenium.common.exceptions import TimeoutException');
+    expect(code).toContain('def is_present(driver, locator, timeout):');
+    expect(code).toContain('from selenium.webdriver.support import expected_conditions as EC');
+    expect(code).toContain('from selenium.webdriver.support.ui import WebDriverWait');
     expect(code).toContain('# [Step 1] Tap login');
-    expect(code).toContain('driver.find_element(AppiumBy.ACCESSIBILITY_ID, "login-btn").click()');
-    expect(code).toContain('time.sleep(0.75)');
+    expect(code).toContain(
+      'element = WebDriverWait(driver, 0.75).until(EC.visibility_of_element_located((AppiumBy.ACCESSIBILITY_ID, "login-btn")))',
+    );
+    expect(code).toContain('element.click()');
+    expect(code).toContain(
+      'assert WebDriverWait(driver, 0.75).until(EC.presence_of_element_located((AppiumBy.ACCESSIBILITY_ID, "welcome-text"))), "Expected element to exist"',
+    );
     expect(code).toContain('# [Step 2] Verify welcome');
   });
 
-  it('should insert time.sleep between branch child steps', function () {
+  it('should wait inside branch child steps instead of sleeping', function () {
     const code = getPytestTestFlowCode({
       steps: [
         {
@@ -57,13 +65,17 @@ describe('test-flow-recorder/pytest.js', function () {
       stepDelayMs: 500,
     });
 
-    expect(code).toContain('import time');
-    expect(code).toContain('if driver.find_elements(AppiumBy.ACCESSIBILITY_ID, "modal"):');
-    expect(code).toContain('time.sleep(0.5)');
-    expect(code).toContain('driver.find_element(AppiumBy.ACCESSIBILITY_ID, "continue").click()');
+    expect(code).toContain('if is_present(driver, (AppiumBy.ACCESSIBILITY_ID, "modal"), 0.5):');
+    expect(code).toContain(
+      'element = WebDriverWait(driver, 0.5).until(EC.visibility_of_element_located((AppiumBy.ACCESSIBILITY_ID, "confirm")))',
+    );
+    expect(code).toContain(
+      'element = WebDriverWait(driver, 0.5).until(EC.visibility_of_element_located((AppiumBy.ACCESSIBILITY_ID, "continue")))',
+    );
+    expect(code).toContain('element.click()');
   });
 
-  it('should omit time import and sleeps when delay is disabled', function () {
+  it('should omit wait imports when timeout is disabled', function () {
     const code = getPytestTestFlowCode({
       steps: [
         {
@@ -75,7 +87,10 @@ describe('test-flow-recorder/pytest.js', function () {
       stepDelayMs: 0,
     });
 
-    expect(code).not.toContain('import time');
-    expect(code).not.toContain('time.sleep(');
+    expect(code).not.toContain('WebDriverWait');
+    expect(code).not.toContain('expected_conditions as EC');
+    expect(code).not.toContain('TimeoutException');
+    expect(code).toContain('element = driver.find_element(AppiumBy.ACCESSIBILITY_ID, "only-step")');
+    expect(code).toContain('element.click()');
   });
 });
